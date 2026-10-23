@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,6 +25,9 @@ const (
 // solanaCollector respresents a set of solana metrics
 type solanaCollector struct {
 	config                    *config.Config
+	cacheMu                   sync.RWMutex
+	refreshMu                 sync.Mutex
+	cachedMetrics             []prometheus.Metric
 	totalValidatorsDesc       *prometheus.Desc
 	validatorActivatedStake   *prometheus.Desc
 	validatorLastVote         *prometheus.Desc
@@ -65,7 +69,7 @@ type solanaCollector struct {
 
 // NewSolanaCollector exports solana collector metrics to prometheus
 func NewSolanaCollector(cfg *config.Config) *solanaCollector {
-	return &solanaCollector{
+	collector := &solanaCollector{
 		config: cfg,
 		totalValidatorsDesc: prometheus.NewDesc(
 			"solana_active_validators",
@@ -215,7 +219,8 @@ func NewSolanaCollector(cfg *config.Config) *solanaCollector {
 			[]string{"votekey", "pubkey"}, nil,
 		),
 	}
-
+	go collector.runMetricsRefresh()
+	return collector
 }
 
 // Desribe exports metrics to the channel
@@ -457,7 +462,69 @@ func (c *solanaCollector) AlertValidatorStatus(msg string, ch chan<- prometheus.
 // 9. Get current block time and previous block time and difference of both.
 // 10. Validator current Epoch Credit
 // 11. Average current Epoch Credit
+// Collect serves the latest cached snapshot. RPC calls happen only during refreshes.
 func (c *solanaCollector) Collect(ch chan<- prometheus.Metric) {
+	c.cacheMu.RLock()
+	empty := len(c.cachedMetrics) == 0
+	c.cacheMu.RUnlock()
+	if empty {
+		c.refreshMetrics()
+	}
+
+	c.cacheMu.RLock()
+	metrics := append([]prometheus.Metric(nil), c.cachedMetrics...)
+	c.cacheMu.RUnlock()
+	for _, metric := range metrics {
+		ch <- metric
+	}
+}
+
+func (c *solanaCollector) refreshInterval() time.Duration {
+	if c.config != nil {
+		if interval, err := time.ParseDuration(c.config.Scraper.Rate); err == nil && interval > 0 {
+			return interval
+		}
+	}
+	return 30 * time.Second
+}
+
+func (c *solanaCollector) runMetricsRefresh() {
+	ticker := time.NewTicker(c.refreshInterval())
+	defer ticker.Stop()
+	for range ticker.C {
+		c.refreshMetrics()
+	}
+}
+
+func (c *solanaCollector) refreshMetrics() {
+	// Ensure overlapping scrapes and the background ticker never run RPC collection concurrently.
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	metrics := make(chan prometheus.Metric)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(metrics)
+		c.collectFresh(metrics)
+	}()
+	snapshot := make([]prometheus.Metric, 0, 256)
+	for metric := range metrics {
+		snapshot = append(snapshot, metric)
+	}
+	<-done
+	if len(snapshot) == 0 {
+		log.Printf("Metric refresh returned no metrics; retaining previous snapshot")
+		return
+	}
+
+	c.cacheMu.Lock()
+	c.cachedMetrics = snapshot
+	c.cacheMu.Unlock()
+}
+
+// collectFresh performs the RPC-backed collection used to build a snapshot.
+func (c *solanaCollector) collectFresh(ch chan<- prometheus.Metric) {
 	localrpcstatus := 1.0 // set the local rpc connectivity by default to 1
 	accs, err := monitor.GetVoteAccounts(c.config, utils.Validator) // get vote accounts
 	if err != nil {
