@@ -33,8 +33,10 @@ type (
 
 	// Scraper defines the time intervals for multiple scrapers to fetch the data
 	Scraper struct {
-		// Rate is to call and get the data for specified targets on that particular time interval
+		// Rate controls how often RPC-backed exporter metrics are refreshed.
 		Rate string `mapstructure:"rate"`
+		// SlotRate controls how often the slot watcher polls Solana.
+		SlotRate string `mapstructure:"slot_rate"`
 	}
 
 	// Prometheus stores Prometheus details
