@@ -172,7 +172,14 @@ func init() {
 // 11. Valid and total blocks produced
 // 12. Skipped slots and total slots skipped
 func (c *solanaCollector) WatchSlots(cfg *config.Config) {
-	ticker := time.NewTicker(slotPacerSchedule)
+	interval := slotPacerSchedule
+	if cfg != nil {
+		if configured, err := time.ParseDuration(cfg.Scraper.SlotRate); err == nil && configured > 0 {
+			interval = configured
+		}
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	for {
 		<-ticker.C
